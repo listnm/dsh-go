@@ -1,0 +1,117 @@
+name: iOS IPA (unsigned)
+
+# Builds the app with the on-device engine prepared, archives it without signing
+# and uploads the .ipa. stage=smoke stops after the engine is prepared.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "smoke: toolchain + engine prep only; full: archive the IPA"
+        type: choice
+        options: [smoke, full]
+        default: full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      FLUTTER_VERSION: 3.47.7
+      FLUTTER_SHA256: dd9da574c3168460550117eb0e8dd0313ae934fabf64a82a6d557fff5fd1422e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          sw_vers
+          xcodebuild -version || true
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          test -n "$latest"
+          echo "using $latest"
+          sudo xcode-select -s "$latest"
+          echo "DEVELOPER_DIR=$latest/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install Flutter
+        run: |
+          archive="flutter_macos_arm64_${FLUTTER_VERSION}-stable.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://storage.googleapis.com/flutter_infra_release/releases/stable/macos/$archive"
+          echo "$FLUTTER_SHA256  $RUNNER_TEMP/$archive" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/$archive" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs -o "$RUNNER_TEMP/rustup.sh"
+          sh "$RUNNER_TEMP/rustup.sh" -y --profile minimal --default-toolchain stable >/dev/null
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve Dart dependencies
+        run: |
+          flutter --version
+          python3 app/tool/l10n_merge.py --no-gen
+          cd app
+          flutter pub get --enforce-lockfile
+          flutter gen-l10n
+
+      - name: Build the phone native library
+        run: bash tooling/ios/build-phone-self-runner.sh
+
+      - name: Prepare the engine
+        run: |
+          bash tooling/ios/prepare-engine.sh
+          ls -la app/ios/Engine
+
+      - name: Install the iSH build tools
+        if: inputs.stage == 'full'
+        run: |
+          brew install llvm lld
+          python3 -m venv "$RUNNER_TEMP/ish-tools"
+          "$RUNNER_TEMP/ish-tools/bin/pip" install meson==1.7.2 ninja==1.11.1.4
+          echo "$RUNNER_TEMP/ish-tools/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          PATH="$(brew --prefix lld)/bin:$PATH" ld.lld --version
+
+      - name: Build the iSH guest for a device
+        if: inputs.stage == 'full'
+        run: bash tooling/ios/build-guest-addon.sh iphoneos app/ios/Engine/build/iphoneos/guest
+
+      - name: Build the engine native pieces for a device
+        if: inputs.stage == 'full'
+        run: bash tooling/ios/build-engine-native.sh iphoneos app/ios/Engine/build/iphoneos
+
+      - name: Archive without signing
+        if: inputs.stage == 'full'
+        run: |
+          ( cd app && flutter build ios --release --no-codesign --config-only )
+          xcodebuild archive -workspace app/ios/Runner.xcworkspace -scheme Runner -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tail -60
+          app="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app"
+          test -d "$app"
+          ls "$app/Frameworks"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$app" "$RUNNER_TEMP/ipa/Payload/"
+          ( cd "$RUNNER_TEMP/ipa" && ditto -c -k --keepParent Payload "$RUNNER_TEMP/DSH-Go-unsigned.ipa" )
+          ls -l "$RUNNER_TEMP/DSH-Go-unsigned.ipa"
+
+      - name: Upload the unsigned IPA
+        if: inputs.stage == 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: ${{ runner.temp }}/DSH-Go-unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
